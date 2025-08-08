@@ -18,6 +18,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Configurações via Environment Variables
 AIRTABLE_API_KEY = os.environ.get('AIRTABLE_API_KEY', 'patiRLOfTIk9sv0td.7a4659adf17b1c464b25f4a07e176a36218757391d396be5afc4d6181c3dc429')
 TENEX_API_KEY_CREDILLY = os.environ.get('TENEX_API_KEY_CREDILLY', 'hm8n7A16jDPeD71SSWTKYlnmBDNv8C9J0evQaowDLaA')
+TENEX_API_KEY_TURING = os.environ.get('TENEX_API_KEY_TURING', '')
 
 # Configurações SendGrid
 SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY', '')
@@ -36,7 +37,8 @@ BCC_SAMPLE_PERCENT = float(os.environ.get('BCC_SAMPLE_PERCENT', '0'))  # 0 = des
 # Modo teste: controlado por env var. Produção por padrão.
 MODO_TESTE = os.environ.get('MODO_TESTE', 'false').lower() == 'true'
 PROCESSAR_CREDILLY = True
-PROCESSAR_TURING = False
+# Habilite Turing via ENV: PROCESSAR_TURING=true
+PROCESSAR_TURING = os.environ.get('PROCESSAR_TURING', 'true').lower() == 'true'
 LIMITE_VENCIDAS, LIMITE_HOJE, LIMITE_AMANHA = None, None, None
 # Horário permitido (padrão 9-20) com possibilidade de override por ENV
 HORARIO_INICIO = int(os.environ.get('HORARIO_INICIO', '9'))
@@ -46,6 +48,7 @@ NOTIFICATION_FINALIZADO_URL = "https://api.pushcut.io/-KVMKI_4PP5GMnuH0M9oz/noti
 AIRTABLE_BASE_ID = 'app3SiNzJv7q5BDkV'
 CLIENTES_TABLE_ID = 'tbl8YhBey4l9cOqLT'
 TENEX_URL_CREDILLY = "https://credilly.tenex.com.br/api/v2/vendas/"
+TENEX_URL_TURING = "https://turing.tenex.com.br/api/v2/vendas/"
 AIRTABLE_BASE_URL = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}"
 
 # Supabase (logs)
@@ -278,6 +281,9 @@ def buscar_todos_clientes_airtable() -> Dict[str, Dict]:
                 id_credilly = fields.get('ID Credilly', '')
                 if id_credilly:
                     clientes_dict[f"CRED-{id_credilly}"] = record
+                id_turing = fields.get('ID Turing', '')
+                if id_turing:
+                    clientes_dict[f"TUR-{id_turing}"] = record
             if "offset" not in data:
                 break
             offset = data["offset"]
@@ -312,6 +318,12 @@ def buscar_parcelas_por_periodo(clientes_dict: Dict[str, Dict], sistema: str) ->
         url = TENEX_URL_CREDILLY
         api_key = TENEX_API_KEY_CREDILLY
         prefixo = "CRED"
+    elif sistema == 'turing':
+        url = TENEX_URL_TURING
+        api_key = TENEX_API_KEY_TURING
+        prefixo = "TUR"
+    else:
+        raise ValueError("sistema inválido. Use 'credilly' ou 'turing'")
     logging.info(f"🔍 Buscando parcelas no sistema {sistema.upper()}...")
     hoje = datetime.now().date()
     ontem = hoje - timedelta(days=1)
@@ -355,11 +367,11 @@ def buscar_parcelas_por_periodo(clientes_dict: Dict[str, Dict], sistema: str) ->
                     except:
                         continue
                     if vencimento == ontem:
-                        parcelas_por_periodo["venceu_ontem"].append((parcela, cliente, id_cliente))
+                        parcelas_por_periodo["venceu_ontem"].append((parcela, cliente, id_cliente, sistema))
                     elif vencimento == hoje:
-                        parcelas_por_periodo["vence_hoje"].append((parcela, cliente, id_cliente))
+                        parcelas_por_periodo["vence_hoje"].append((parcela, cliente, id_cliente, sistema))
                     elif vencimento == amanha:
-                        parcelas_por_periodo["vence_amanha"].append((parcela, cliente, id_cliente))
+                        parcelas_por_periodo["vence_amanha"].append((parcela, cliente, id_cliente, sistema))
         except Exception as e:
             logging.error(f"❌ Erro ao processar lote {i//100+1} após retries: {str(e)}")
         if i + 100 < len(ids_sistema):
@@ -368,13 +380,19 @@ def buscar_parcelas_por_periodo(clientes_dict: Dict[str, Dict], sistema: str) ->
         logging.info(f"  → {len(parcelas)} parcelas em '{periodo}'")
     return parcelas_por_periodo
 
-def processar_parcelas_periodo(parcelas: List[Tuple[Dict, Dict, str]], tipo: str, limite: Optional[int]) -> Dict:
+def processar_parcelas_periodo(parcelas: List[Tuple[Dict, Dict, str, str]], tipo: str, limite: Optional[int]) -> Dict:
     stats = {"total": len(parcelas), "enviados": 0, "ja_enviados": 0, "sem_email": 0, "erros": 0}
     if limite:
         parcelas = parcelas[:limite]
         logging.info(f"📋 Limitando {tipo} a {limite} e-mails")
 
-    for parcela, cliente, cliente_id in parcelas:
+    for item in parcelas:
+        # Backward-compat: alguns itens antigos podem não ter sistema; default credilly
+        if len(item) == 3:
+            parcela, cliente, cliente_id = item
+            sistema_origem = 'credilly'
+        else:
+            parcela, cliente, cliente_id, sistema_origem = item
         nome = cliente['fields'].get('Nome do cliente', 'Sem nome')
         email = cliente['fields'].get('Email', '')
         if not email:
@@ -382,7 +400,7 @@ def processar_parcelas_periodo(parcelas: List[Tuple[Dict, Dict, str]], tipo: str
             stats["sem_email"] += 1
             # log sem_email
             log_disparo_supabase({
-                "sistema": "credilly",
+                "sistema": sistema_origem,
                 "periodo": tipo,
                 "cliente_airtable_id": cliente.get('id'),
                 "cliente_sistema_id": cliente_id,
@@ -418,7 +436,7 @@ def processar_parcelas_periodo(parcelas: List[Tuple[Dict, Dict, str]], tipo: str
 
             # log envio/erro
             log_disparo_supabase({
-                "sistema": "credilly",
+                "sistema": sistema_origem,
                 "periodo": tipo,
                 "cliente_airtable_id": cliente.get('id'),
                 "cliente_sistema_id": cliente_id,
@@ -444,7 +462,7 @@ def processar_parcelas_periodo(parcelas: List[Tuple[Dict, Dict, str]], tipo: str
             stats["erros"] += 1
             # log erro inesperado
             log_disparo_supabase({
-                "sistema": "credilly",
+                "sistema": sistema_origem,
                 "periodo": tipo,
                 "cliente_airtable_id": cliente.get('id'),
                 "cliente_sistema_id": cliente_id,
